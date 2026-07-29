@@ -1,6 +1,6 @@
 /* XMRig
  * Copyright (c) 2018-2021 SChernykh   <https://github.com/SChernykh>
- * Copyright (c) 2016-2021 XMRig       <https://github.com/xmrig>, <support@xmrig.com>
+ * Copyright (c) 2016-2026 XMRig       <https://github.com/xmrig>, <support@xmrig.com>
  *
  *   This program is free software: you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
@@ -29,56 +29,209 @@
 #include <windows.h>
 
 
-#define SERVICE_NAME    L"WinRing0_1_2_0"
-#define IOCTL_READ_MSR  CTL_CODE(40000, 0x821, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_WRITE_MSR CTL_CODE(40000, 0x822, METHOD_BUFFERED, FILE_ANY_ACCESS)
-
-
 namespace xmrig {
 
 
-static const wchar_t *kServiceName = SERVICE_NAME;
+static constexpr const wchar_t *kPawnIoRegistryKey = L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\PawnIO";
+static constexpr const wchar_t *kPawnIoLibrary     = L"PawnIOLib.dll";
+
+
+static std::wstring appendPath(std::wstring path, const wchar_t *name)
+{
+    if (!path.empty() && path.back() != L'\\' && path.back() != L'/') {
+        path += L'\\';
+    }
+
+    path += name;
+
+    return path;
+}
+
+
+static std::wstring executableDirectory()
+{
+    std::vector<wchar_t> path(MAX_PATH);
+
+    for (;;) {
+        SetLastError(ERROR_SUCCESS);
+        const DWORD length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
+        if (length == 0) {
+            return {};
+        }
+
+        if (length < path.size() - 1 || GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
+            path.resize(length);
+            break;
+        }
+
+        path.resize(path.size() * 2);
+    }
+
+    const auto pos = path.empty() ? std::wstring::npos : std::wstring(path.data(), path.size()).find_last_of(L"\\/");
+
+    return pos == std::wstring::npos ? std::wstring() : std::wstring(path.data(), pos);
+}
+
+
+static std::wstring pawnIoDirectory()
+{
+    DWORD size = 0;
+    const DWORD flags = RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY;
+
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, kPawnIoRegistryKey, L"InstallLocation", flags, nullptr, nullptr, &size) == ERROR_SUCCESS && size > sizeof(wchar_t)) {
+        std::vector<wchar_t> path(size / sizeof(wchar_t) + 1);
+        if (RegGetValueW(HKEY_LOCAL_MACHINE, kPawnIoRegistryKey, L"InstallLocation", flags, nullptr, path.data(), &size) == ERROR_SUCCESS) {
+            return path.data();
+        }
+    }
+
+    const DWORD length = GetEnvironmentVariableW(L"ProgramFiles", nullptr, 0);
+    if (length > 1) {
+        std::vector<wchar_t> path(length);
+        if (GetEnvironmentVariableW(L"ProgramFiles", path.data(), length) > 0) {
+            return appendPath(path.data(), L"PawnIO");
+        }
+    }
+
+    return {};
+}
+
+
+static bool readFile(const std::wstring &path, std::vector<unsigned char> &data)
+{
+    const HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+
+    LARGE_INTEGER size;
+    const bool validSize = GetFileSizeEx(file, &size) && size.QuadPart > 0 && size.QuadPart <= MAXDWORD;
+    if (!validSize) {
+        CloseHandle(file);
+        return false;
+    }
+
+    data.resize(static_cast<size_t>(size.QuadPart));
+
+    DWORD bytesRead = 0;
+    const bool success = ReadFile(file, data.data(), static_cast<DWORD>(data.size()), &bytesRead, nullptr) && bytesRead == data.size();
+    CloseHandle(file);
+
+    return success;
+}
 
 
 class MsrPrivate
 {
 public:
-    bool uninstall()
+    using Open    = HRESULT (STDAPICALLTYPE *)(PHANDLE);
+    using Load    = HRESULT (STDAPICALLTYPE *)(HANDLE, const UCHAR *, SIZE_T);
+    using Execute = HRESULT (STDAPICALLTYPE *)(HANDLE, PCSTR, const ULONG64 *, SIZE_T, PULONG64, SIZE_T, PSIZE_T);
+    using Close   = HRESULT (STDAPICALLTYPE *)(HANDLE);
+
+    ~MsrPrivate()
     {
-        if (driver != INVALID_HANDLE_VALUE) {
-            CloseHandle(driver);
+        if (handle && close) {
+            close(handle);
         }
 
-        if (!service) {
+        if (library) {
+            FreeLibrary(library);
+        }
+    }
+
+    bool init()
+    {
+        const auto directory = pawnIoDirectory();
+        if (directory.empty()) {
+            LOG_WARN("%s " YELLOW_BOLD("PawnIO is not installed; download it from https://pawnio.eu"), Msr::tag());
+            return false;
+        }
+
+        const auto libraryPath = appendPath(directory, kPawnIoLibrary);
+        library = LoadLibraryExW(libraryPath.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+        if (!library) {
+            LOG_ERR("%s " RED("failed to load PawnIOLib.dll, error %u"), Msr::tag(), GetLastError());
+            return false;
+        }
+
+        open    = reinterpret_cast<Open>(GetProcAddress(library, "pawnio_open"));
+        load    = reinterpret_cast<Load>(GetProcAddress(library, "pawnio_load"));
+        execute = reinterpret_cast<Execute>(GetProcAddress(library, "pawnio_execute"));
+        close   = reinterpret_cast<Close>(GetProcAddress(library, "pawnio_close"));
+
+        if (!open || !load || !execute || !close) {
+            LOG_ERR("%s " RED_BOLD("installed PawnIOLib.dll has an incompatible API"), Msr::tag());
+            return false;
+        }
+
+        HRESULT result = open(&handle);
+        if (FAILED(result)) {
+            LOG_ERR("%s " RED("failed to open PawnIO, HRESULT 0x%08lX"), Msr::tag(), static_cast<unsigned long>(result));
+            return false;
+        }
+
+        const wchar_t *moduleName = nullptr;
+        switch (Cpu::info()->vendor()) {
+        case ICpuInfo::VENDOR_INTEL:
+            moduleName = L"IntelMSR.bin";
+            break;
+
+        case ICpuInfo::VENDOR_AMD:
+            moduleName = L"AMDFamily17.bin";
+            break;
+
+        default:
+            LOG_ERR("%s " RED_BOLD("PawnIO has no MSR module for this CPU vendor"), Msr::tag());
+            return false;
+        }
+
+        std::vector<unsigned char> module;
+        const auto modulePath = appendPath(executableDirectory(), moduleName);
+        if (!readFile(modulePath, module)) {
+            LOG_ERR("%s " RED("failed to read PawnIO module \"%ls\", error %u"), Msr::tag(), modulePath.c_str(), GetLastError());
+            return false;
+        }
+
+        result = load(handle, module.data(), module.size());
+        if (FAILED(result)) {
+            LOG_ERR("%s " RED("failed to load PawnIO module \"%ls\", HRESULT 0x%08lX"), Msr::tag(), moduleName, static_cast<unsigned long>(result));
+            return false;
+        }
+
+        return true;
+    }
+
+    bool read(uint32_t reg, uint64_t &value) const
+    {
+        const ULONG64 input = reg;
+        ULONG64 output      = 0;
+        SIZE_T returned     = 0;
+        const HRESULT result = execute(handle, "ioctl_read_msr", &input, 1, &output, 1, &returned);
+
+        if (SUCCEEDED(result) && returned == 1) {
+            value = output;
             return true;
         }
 
-        bool result = true;
-
-        if (!reuse) {
-            SERVICE_STATUS serviceStatus;
-
-            if (!ControlService(service, SERVICE_CONTROL_STOP, &serviceStatus)) {
-                result = false;
-            }
-
-            if (!DeleteService(service)) {
-                LOG_ERR("%s " RED("failed to remove WinRing0 driver, error %u"), Msr::tag(), GetLastError());
-                result = false;
-            }
-        }
-
-        CloseServiceHandle(service);
-        service = nullptr;
-
-        return result;
+        return false;
     }
 
+    bool write(uint32_t reg, uint64_t value) const
+    {
+        const ULONG64 input[2] = { reg, value };
+        SIZE_T returned        = 0;
 
-    bool reuse          = false;
-    HANDLE driver       = INVALID_HANDLE_VALUE;
-    SC_HANDLE manager   = nullptr;
-    SC_HANDLE service   = nullptr;
+        return SUCCEEDED(execute(handle, "ioctl_write_msr", input, 2, nullptr, 0, &returned));
+    }
+
+    HMODULE library = nullptr;
+    HANDLE handle   = nullptr;
+    Open open       = nullptr;
+    Load load       = nullptr;
+    Execute execute = nullptr;
+    Close close     = nullptr;
+    bool available  = false;
 };
 
 
@@ -87,122 +240,19 @@ public:
 
 xmrig::Msr::Msr() : d_ptr(new MsrPrivate())
 {
-    DWORD err = 0;
-
-    d_ptr->manager = OpenSCManager(nullptr, nullptr, SC_MANAGER_ALL_ACCESS);
-    if (!d_ptr->manager) {
-        if ((err = GetLastError()) == ERROR_ACCESS_DENIED) {
-            LOG_WARN("%s " YELLOW_BOLD("to access MSR registers Administrator privileges required."), tag());
-        }
-        else {
-            LOG_ERR("%s " RED("failed to open service control manager, error %u"), tag(), err);
-        }
-
-        return;
-    }
-
-    std::vector<wchar_t> dir;
-
-    do {
-        dir.resize(dir.empty() ? MAX_PATH : dir.size() * 2);
-        GetModuleFileNameW(nullptr, dir.data(), dir.size());
-        err = GetLastError();
-    } while (err == ERROR_INSUFFICIENT_BUFFER);
-
-    if (err != ERROR_SUCCESS) {
-        LOG_ERR("%s " RED("failed to get path to driver, error %u"), tag(), err);
-        return;
-    }
-
-    for (auto it = dir.end() - 1; it != dir.begin(); --it) {
-        if ((*it == L'\\') || (*it == L'/')) {
-            ++it;
-            *it = L'\0';
-            break;
-        }
-    }
-
-    const std::wstring path = std::wstring(dir.data()) + L"WinRing0x64.sys";
-
-    d_ptr->service = OpenServiceW(d_ptr->manager, kServiceName, SERVICE_ALL_ACCESS);
-    if (d_ptr->service) {
-        LOG_WARN("%s " YELLOW("service ") YELLOW_BOLD("WinRing0_1_2_0") YELLOW(" already exists"), tag());
-
-        SERVICE_STATUS status;
-        const auto rc = QueryServiceStatus(d_ptr->service, &status);
-
-        if (rc) {
-            DWORD dwBytesNeeded = 0;
-
-            QueryServiceConfigA(d_ptr->service, nullptr, 0, &dwBytesNeeded);
-            if (GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
-                std::vector<BYTE> buffer(dwBytesNeeded);
-                auto config = reinterpret_cast<LPQUERY_SERVICE_CONFIGA>(buffer.data());
-
-                if (QueryServiceConfigA(d_ptr->service, config, buffer.size(), &dwBytesNeeded)) {
-                    LOG_INFO("%s " YELLOW("service path: ") YELLOW_BOLD("\"%s\""), tag(), config->lpBinaryPathName);
-                }
-            }
-        }
-
-        if (rc && status.dwCurrentState == SERVICE_RUNNING) {
-            d_ptr->reuse = true;
-        }
-        else if (!d_ptr->uninstall()) {
-            return;
-        }
-    }
-
-    d_ptr->driver = CreateFileW(L"\\\\.\\" SERVICE_NAME, GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (d_ptr->driver != INVALID_HANDLE_VALUE) {
-        LOG_WARN("%s " YELLOW("service ") YELLOW_BOLD("WinRing0_1_2_0") YELLOW(" already exists, but with a different service name"), tag());
-        d_ptr->reuse = true;
-        return;
-    }
-
-    if (!d_ptr->reuse) {
-        d_ptr->service = CreateServiceW(d_ptr->manager, kServiceName, kServiceName, SERVICE_ALL_ACCESS, SERVICE_KERNEL_DRIVER, SERVICE_DEMAND_START, SERVICE_ERROR_NORMAL, path.c_str(), nullptr, nullptr, nullptr, nullptr, nullptr);
-        if (!d_ptr->service) {
-            LOG_ERR("%s " RED("failed to install WinRing0 driver, error %u"), tag(), GetLastError());
-
-            return;
-        }
-
-        if (!StartService(d_ptr->service, 0, nullptr)) {
-            err = GetLastError();
-            if (err != ERROR_SERVICE_ALREADY_RUNNING) {
-                if (err == ERROR_FILE_NOT_FOUND) {
-                    LOG_ERR("%s " RED("failed to start WinRing0 driver: ") RED_BOLD("\"WinRing0x64.sys not found\""), tag());
-                }
-                else {
-                    LOG_ERR("%s " RED("failed to start WinRing0 driver, error %u"), tag(), err);
-                }
-
-                d_ptr->uninstall();
-
-                return;
-            }
-        }
-    }
-
-    d_ptr->driver = CreateFileW(L"\\\\.\\" SERVICE_NAME, GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (d_ptr->driver == INVALID_HANDLE_VALUE) {
-        LOG_ERR("%s " RED("failed to connect to WinRing0 driver, error %u"), tag(), GetLastError());;
-    }
+    d_ptr->available = d_ptr->init();
 }
 
 
 xmrig::Msr::~Msr()
 {
-    d_ptr->uninstall();
-
     delete d_ptr;
 }
 
 
 bool xmrig::Msr::isAvailable() const
 {
-    return d_ptr->driver != INVALID_HANDLE_VALUE;
+    return d_ptr->available;
 }
 
 
@@ -235,9 +285,7 @@ bool xmrig::Msr::rdmsr(uint32_t reg, int32_t cpu, uint64_t &value) const
 {
     assert(cpu < 0);
 
-    DWORD size = 0;
-
-    return DeviceIoControl(d_ptr->driver, IOCTL_READ_MSR, &reg, sizeof(reg), &value, sizeof(value), &size, nullptr) != 0;
+    return d_ptr->read(reg, value);
 }
 
 
@@ -245,18 +293,5 @@ bool xmrig::Msr::wrmsr(uint32_t reg, uint64_t value, int32_t cpu)
 {
     assert(cpu < 0);
 
-    struct {
-        uint32_t reg = 0;
-        uint32_t value[2]{};
-    } input;
-
-    static_assert(sizeof(input) == 12, "Invalid struct size for WinRing0 driver");
-
-    input.reg = reg;
-    *(reinterpret_cast<uint64_t*>(input.value)) = value;
-
-    DWORD output;
-    DWORD k;
-
-    return DeviceIoControl(d_ptr->driver, IOCTL_WRITE_MSR, &input, sizeof(input), &output, sizeof(output), &k, nullptr) != 0;
+    return d_ptr->write(reg, value);
 }

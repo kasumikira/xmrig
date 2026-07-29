@@ -151,6 +151,14 @@ bool xmrig::RxMsr::init(const RxConfig &config, const std::vector<CpuThread> &th
         m_cacheQoS = false;
     }
 
+#   ifdef XMRIG_OS_WIN
+    if (m_cacheQoS) {
+        LOG_WARN("%s " YELLOW_BOLD("cache QoS is temporarily unavailable with the PawnIO backend"), Msr::tag());
+
+        m_cacheQoS = false;
+    }
+#   endif
+
     if ((m_enabled = wrmsr(preset, threads, m_cacheQoS, config.rdmsr()))) {
         LOG_NOTICE("%s " GREEN_BOLD("register values for \"%s\" preset have been set successfully") BLACK_BOLD(" (%" PRIu64 " ms)"), Msr::tag(), config.msrPresetName(), Chrono::steadyMSecs() - ts);
     }
